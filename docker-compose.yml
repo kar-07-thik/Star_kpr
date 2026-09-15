@@ -1,0 +1,61 @@
+name: stars-bca
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: stars-bca-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  backend:
+    build: ./star-bca-backend
+    container_name: stars-bca-backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file:
+      - ./star-bca-backend/.env
+    environment:
+      MONGO_URI: mongodb://mongo:27017/star-kpr
+      PORT: "3000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  frontend:
+    build: ./stars-bca-frontend
+    container_name: stars-bca-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_PROXY_TARGET: http://backend:3000
+    depends_on:
+      - backend
+
+  # One-shot: docker compose --profile seed run --rm seed
+  seed:
+    build: ./star-bca-backend
+    container_name: stars-bca-seed
+    profiles: ["seed"]
+    env_file:
+      - ./star-bca-backend/.env
+    environment:
+      MONGO_URI: mongodb://mongo:27017/star-kpr
+    depends_on:
+      mongo:
+        condition: service_healthy
+    command: npm run seed
+    restart: "no"
+
+volumes:
+  mongo_data:

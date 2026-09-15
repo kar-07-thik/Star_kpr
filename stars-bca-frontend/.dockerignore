@@ -1,0 +1,6 @@
+cd /d c:\Users\prema\Downloads\star_FrameWork_Team
+echo node_modules/>> .gitignore
+echo star_frame/stars-bca-frontend/node_modules/>> .gitignore
+git rm -r --cached star_frame/stars-bca-frontend/node_modules
+git add .gitignore
+git commit -m "Ignore frontend node_modules and untrack cached files"
