@@ -2,6 +2,7 @@ const Submission = require('../models/Submission');
 const Activity = require('../models/Activity');
 const { calculateSubmissionScore } = require('../utils/scoringEngine');
 const OpenAI = require('openai');
+const { InferenceClient } = require('@huggingface/inference');
 
 const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
 
@@ -11,10 +12,13 @@ function getProvider() {
   if ((requested === 'gemini' || requested === '') && process.env.GEMINI_API_KEY) return 'gemini';
   if ((requested === 'groq' || requested === '') && process.env.GROQ_API_KEY) return 'groq';
   if ((requested === 'tokenrouter' || requested === '') && process.env.TOKENROUTER_API_KEY) return 'tokenrouter';
+  if ((requested === 'huggingface' || requested === '') && process.env.HF_TOKEN) return 'huggingface';
+
   if (process.env.OPENAI_API_KEY) return 'openai';
   if (process.env.GEMINI_API_KEY) return 'gemini';
   if (process.env.GROQ_API_KEY) return 'groq';
   if (process.env.TOKENROUTER_API_KEY) return 'tokenrouter';
+  if (process.env.HF_TOKEN) return 'huggingface';
   return null;
 }
 
@@ -31,12 +35,18 @@ function providerConfig(provider) {
       model: process.env.GEMINI_MODEL || 'gemini-1.5-flash',
     };
   }
-  if (provider === 'groq') {
-    return {
-      label: 'Groq',
-      model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
-    };
-  }
+  if (provider === 'huggingface') {
+  return {
+    label: 'Hugging Face',
+    model: process.env.HF_MODEL || 'Qwen/Qwen2.5-VL-3B-Instruct',
+  };
+}
+  // if (provider === 'groq') {
+  //   return {
+  //     label: 'Groq',
+  //     model: process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
+  //   };
+  // }
   if (provider === 'tokenrouter') {
     return {
       label: 'TokenRouter',
@@ -92,6 +102,8 @@ function buildPrompt(activity, submission) {
     activity: {
       name: activity?.activityName || '',
       vertical: activity?.vertical || '',
+      selectedActivity: activity?.activityName || '',
+      selectedVertical: activity?.vertical || '',
       maximumPoints: Number(activity?.maximumPoints || 0),
       description: activity?.description || '',
       levels,
@@ -108,9 +120,20 @@ function buildPrompt(activity, submission) {
   };
 }
 
-const SYSTEM_PROMPT = `You are the AI evidence reviewer for the STARS framework at KPR College (Student Activity Reward Points System).
+const SYSTEM_PROMPT = `You are the AI evidence reviewer for the STARS framework at KPR College (Student Activity Reward Points System). Faculty members remain the final decision-makers; you provide only a recommendation.
 
-Review each student activity submission and decide whether the provided evidence supports the claim. Evaluate:
+You must perform these checks in this exact order:
+1. Identify the selected STAR activity and vertical from the activity data.
+2. Identify what the uploaded evidence actually proves.
+3. Determine whether that evidence directly supports the selected STAR activity/vertical.
+4. If the evidence is unrelated, invalid for the selected activity, or does not provide evidence of the claimed achievement, return recommendation "Reject", suggestedPoints 0, a confidence reflecting your certainty, reasoning that explicitly says the evidence does not support the selected activity/vertical, and a flag explaining the mismatch.
+5. Only when the evidence is relevant, evaluate validity, level, duration, certificate details, and possible points.
+
+Never award points merely because a document is genuine, official-looking, contains the student's name, or is a valid ID card. A college/student ID card by itself is not evidence for technical skills, internships, certifications, paper presentations, visits, courses, competitions, projects, or other achievement-based STAR activities unless the selected activity explicitly requires an ID card.
+
+If evidence is not relevant to the selected activity/vertical, suggestedPoints MUST be 0. Do not calculate partial points for unrelated evidence.
+
+For relevant evidence, evaluate:
 - Does the description match the activity and its type?
 - Does the stated level match what is claimed?
 - Is the proof URL or certificate plausible and relevant?
@@ -265,7 +288,83 @@ function tokenRouterClient() {
     baseURL: process.env.TOKENROUTER_BASE_URL || 'https://api.tokenrouter.com/v1',
   });
 }
+async function callHuggingFace(data, submission, imagePages = []) {
+  const model = providerConfig('huggingface').model;
+  const token = process.env.HF_TOKEN;
 
+  if (!token) {
+    throw new Error('HF_TOKEN is not configured');
+  }
+
+  const image = submission?.certificateFile;
+
+  const hasImage = Boolean(
+    (image?.url || image?.data) &&
+    image?.contentType?.startsWith('image/') &&
+    (!image.data || image.data.length <= MAX_IMAGE_BYTES)
+  );
+
+  const content = [
+    {
+      type: 'text',
+      text: `Review this STAR framework submission as JSON:\n${JSON.stringify(
+        data,
+        null,
+        2
+      )}`,
+    },
+  ];
+
+  if (hasImage) {
+    content.push({
+      type: 'image_url',
+      image_url: {
+        url:
+          image.url ||
+          `data:${image.contentType};base64,${image.data.toString('base64')}`,
+      },
+    });
+  }
+
+  const generatedPages = Array.isArray(imagePages)
+    ? imagePages.filter((page) => typeof page === 'string' && page.startsWith('data:image/')).slice(0, 50)
+    : [];
+  if (generatedPages.length) {
+    generatedPages.forEach((page) => content.push({ type: 'image_url', image_url: { url: page } }));
+  }
+
+  const client = new InferenceClient(token);
+
+  const response = await client.chatCompletion({
+    model,
+    provider: process.env.HF_PROVIDER || 'featherless-ai',
+    messages: [
+      {
+        role: 'system',
+        content: SYSTEM_PROMPT,
+      },
+      {
+        role: 'user',
+        content,
+      },
+    ],
+    temperature: 0.2,
+    max_tokens: 800,
+  });
+
+  const raw = response?.choices?.[0]?.message?.content || '';
+  const parsed = extractJson(raw);
+
+  if (!parsed) {
+    throw new Error('Hugging Face returned an unparseable response');
+  }
+
+  return {
+    ...parsed,
+    provider: 'huggingface',
+    model,
+  };
+}
 async function callTokenRouter(data, submission, imagePages = []) {
   const model = providerConfig('tokenrouter').model;
   if (!model) throw new Error('TOKENROUTER_MODEL is not configured');
@@ -426,11 +525,33 @@ async function reviewSubmission(submissionId, options = {}) {
       fallbackReason = fallbackReasonFor('TokenRouter', error);
       console.error('[AI] TokenRouter request failed, falling back to rule engine:', error.message);
     }
+  }else if (provider === 'huggingface') {
+    try {
+      review = await callHuggingFace(data, submission, options.imagePages);
+    } catch (error) {
+      fallbackReason = fallbackReasonFor('Hugging Face', error);
+      console.error(
+        '[AI] Hugging Face request failed, falling back to rule engine:',
+        error.message
+      );
+    }
   }
+  
 
   if (!review) {
     review = ruleBasedReview(activity, submission);
+    if (fallbackReason) {
+      
+      review = {
+        ...review,
+        recommendation: 'Review',
+        suggestedPoints: 0,
+        confidence: 0,
+        reasoning: 'AI evidence review was unavailable. Faculty review is required before points can be suggested.',
+      };
+    }
   }
+  
 
   const flags = Array.isArray(review.flags) ? review.flags.map((flag) => String(flag).slice(0, 300)) : [];
   if (fallbackReason) flags.unshift(fallbackReason);
@@ -439,7 +560,9 @@ async function reviewSubmission(submissionId, options = {}) {
     provider: review.provider || 'rule-engine',
     model: review.model || 'unknown',
     recommendation: normalizeRecommendation(review.recommendation),
-    suggestedPoints: clampPoints(review.suggestedPoints, maxPoints),
+    suggestedPoints: normalizeRecommendation(review.recommendation) === 'Reject'
+      ? 0
+      : clampPoints(review.suggestedPoints, maxPoints),
     confidence: clampPoints(review.confidence, 100),
     reasoning: String(review.reasoning || '').slice(0, 2000),
     flags,
